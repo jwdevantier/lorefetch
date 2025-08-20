@@ -19,6 +19,10 @@ go build
 
 Then you get a binary called `lorefetch`.
 
+## Caveats
+Lorefetch does not support "refreshing" an existing maildir. That is, merging new mail into
+an existing maildir.
+
 ## Usage example
 ```
 Usage: ./lorefetch --query 'search terms' [options]
@@ -53,13 +57,47 @@ Examples:
     ./lorefetch --query 's:PATCH AND l:netdev'
 
 Xapian search syntax:
-  l:list-name    - mailing list
-  f:email        - from address
-  t:email        - to address
-  c:email        - cc address
-  s:subject      - subject line
-  AND, OR, NOT   - boolean operators
-  "exact phrase" - exact phrase matching
+Lorefetch, like lei, submits queries to the remote public-inbox instance.
+public-inbox servers in turn use Xapian for search.
+
+Xapian queries are built by one or more search-prefixes using the AND, OR and NOT operators and parentheses () for grouping
+
+The following is a list of search prefixes supported by public-inbox:
+    s:           match within Subject  e.g. s:"a quick brown fox"
+    d:           match date-time range, git "approxidate" formats supported
+                 Open-ended ranges such as `d:last.week..' and
+                 `d:..2.days.ago' are supported
+    b:           match within message body, including text attachments
+    nq:          match non-quoted text within message body
+    q:           match quoted text within message body
+    n:           match filename of attachment(s)
+    t:           match within the To header
+    c:           match within the Cc header
+    f:           match within the From header
+    a:           match within the To, Cc, and From headers
+    tc:          match within the To and Cc headers
+    l:           match contents of the List-Id header
+    bs:          match within the Subject and body
+    dfn:         match filename from diff
+    dfa:         match diff removed (-) lines
+    dfb:         match diff added (+) lines
+    dfhh:        match diff hunk header context (usually a function name)
+    dfctx:       match diff context lines
+    dfpre:       match pre-image git blob ID
+    dfpost:      match post-image git blob ID
+    dfblob:      match either pre or post-image git blob ID
+    patchid:     match `git patch-id --stable' output
+    rt:          match received time, like `d:' if sender's clock was correct
+    forpatchid:  the `X-For-Patch-ID' mail header  e.g. forpatchid:stable
+    changeid:    the `X-Change-ID' mail header  e.g. changeid:stable
+
+  Most prefixes are probabilistic, meaning they support stemming
+  and wildcards ('*').  Ranges (such as 'd:') and boolean prefixes
+  do not support stemming or wildcards.
+  The upstream Xapian query parser documentation fully explains
+  the query syntax:
+
+    https://xapian.org/docs/queryparser.html
 ```
 
 ## Notes on searching
