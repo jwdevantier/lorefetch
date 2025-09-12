@@ -11,6 +11,8 @@ Specifically, it:
 4. Downloads a gzipped mbox file containing the **threads** with matching messages
 5. Writes the mbox or equivalent maildir to disk
 
+IF you write to a maildir, then lorefetch now supports synchronizing (writing new mail only).
+
 ## Building
 
 ```
@@ -18,10 +20,6 @@ go build
 ```
 
 Then you get a binary called `lorefetch`.
-
-## Caveats
-Lorefetch does not support "refreshing" an existing maildir. That is, merging new mail into
-an existing maildir.
 
 ## Usage example
 ```
@@ -31,22 +29,20 @@ Download relevant mailing list threads from lore.kernel.org
 
 Options:
   -l string
-    	Mailing list name (shorthand)
+    	-list shorthand
   -list string
     	Mailing list name
-  -maildir
+  -maildir string
     	Save as maildir format (creates cur/new/tmp directories)
+  -mbox string
+    	Save as mbox file
   -q string
-    	Xapian search query (shorthand)
+    	-query shorthand
   -query string
     	Xapian search query (required)
-  -s string
-    	Save to file instead of importing (shorthand)
-  -save-to string
-    	Save to file instead of importing
-  -v	Enable verbose logging (shorthand)
+  -v	-verbose shorthand
   -verbose
-    	Enable verbose logging
+    	verbosity level (0=quiet, 1=info, 2=debug)
 
 Examples:
   * all threads in the last 6 months there jane.example.org is in the CC or TO header

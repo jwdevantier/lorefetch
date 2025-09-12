@@ -1,10 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // SPDX-FileCopyrightText: 2025 Jesper Devantier <jwd@defmacro.it>
+
+// Download mailing list threads from a public-inbox instance like lore.kernel.org
+// All threads for mail matching the provided query is included.
+//
+// Results can be written out as a mailbox (mbox) file or into a maildir.
+// In case of maildir, each mail is written to a file using the sha1 hash
+// of its message-id.
+// A cache is also created, marking each mail written to disk. This prevents
+// Lorefetch from continuously re-adding mail which the user has deleted or moved.
 package main
 
 import (
 	"compress/gzip"
+	"crypto/sha1"
 	"crypto/sha256"
+	"encoding/gob"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -12,6 +23,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/cookiejar"
+	"net/mail"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -24,14 +36,40 @@ import (
 const (
 	baseURL   = "https://lore.kernel.org"
 	userAgent = "Lorefetch/1.x (https://github.com/jwdevantier/lorefetch)"
+
+	fetchTimeoutSeconds = 60
+	cacheVersion        = 1
+	mailFileMode        = 0644
+	maildirMode         = 0755
 )
+
+func dbgLog(fmt string, args ...any) {
+	if config.Verbose >= 1 {
+		log.Printf(fmt, args...)
+	}
+}
+
+type VerbosityFlag int
+
+func (v *VerbosityFlag) String() string {
+	return fmt.Sprintf("%d", *v)
+}
+
+func (v *VerbosityFlag) Set(value string) error {
+	*v++
+	return nil
+}
+
+func (v *VerbosityFlag) IsBoolFlag() bool {
+	return true
+}
 
 type Config struct {
 	Query   string
 	List    string
-	SaveTo  string
-	Maildir bool
-	Verbose bool
+	Maildir string
+	Mbox    string
+	Verbose VerbosityFlag
 }
 
 type AnubisChallenge struct {
@@ -48,11 +86,32 @@ type LoreSearcher struct {
 	verbose bool
 }
 
+type MaildirCache struct {
+	Version int
+	/// <sha1('msg-id') -> bool
+	Cache map[string]bool
+}
+
+func NewMaildirCache() *MaildirCache {
+	return &MaildirCache{
+		Version: cacheVersion,
+		Cache:   make(map[string]bool),
+	}
+}
+
+func (c *MaildirCache) Exists(msgIdHash string) bool {
+	return c.Cache[msgIdHash]
+}
+
+func (c *MaildirCache) Add(msgIdHash string) {
+	c.Cache[msgIdHash] = true
+}
+
 func NewLoreSearcher(verbose bool) *LoreSearcher {
 	jar, _ := cookiejar.New(nil)
 	return &LoreSearcher{
 		client: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: fetchTimeoutSeconds * time.Second,
 			Jar:     jar,
 		},
 		verbose: verbose,
@@ -335,17 +394,12 @@ func (ls *LoreSearcher) FetchMbox(query, mailingList string) (string, error) {
 }
 
 func validateMaildirPath(destPath string) error {
-	// Check if destination exists
-	if _, err := os.Stat(destPath); err == nil {
-		return fmt.Errorf("destination path %s already exists", destPath)
-	}
-
 	// Check if any of the subdirectories exist
 	subdirs := []string{"cur", "new", "tmp"}
 	for _, subdir := range subdirs {
 		subPath := filepath.Join(destPath, subdir)
-		if _, err := os.Stat(subPath); err == nil {
-			return fmt.Errorf("maildir subdirectory %s already exists", subPath)
+		if _, err := os.Stat(subPath); err != nil {
+			return fmt.Errorf("invalid maildir '%s' - sub-directory '%s' missing", destPath, subdir)
 		}
 	}
 
@@ -356,18 +410,11 @@ func createMaildirStructure(destPath string) error {
 	subdirs := []string{"cur", "new", "tmp"}
 	for _, subdir := range subdirs {
 		subPath := filepath.Join(destPath, subdir)
-		if err := os.MkdirAll(subPath, 0755); err != nil {
+		if err := os.MkdirAll(subPath, maildirMode); err != nil {
 			return fmt.Errorf("creating directory %s: %w", subPath, err)
 		}
 	}
 	return nil
-}
-
-func generateMaildirFilename() string {
-	timestamp := time.Now().Unix()
-	pid := os.Getpid()
-	hostname, _ := os.Hostname()
-	return fmt.Sprintf("%d.%d.%s:2,", timestamp, pid, hostname)
 }
 
 func parseMboxMessages(mboxContent string) []string {
@@ -402,44 +449,155 @@ func parseMboxMessages(mboxContent string) []string {
 	return messages
 }
 
+func cachePath(maildirPath string) string {
+	return filepath.Join(maildirPath, ".lorefetch-cache.gob")
+}
+
+func loadCache(maildirPath string) (*MaildirCache, error) {
+	cachePath := cachePath(maildirPath)
+	file, err := os.Open(cachePath)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("opening cache file: %w", err)
+	}
+	defer file.Close()
+
+	var cache MaildirCache
+	decoder := gob.NewDecoder(file)
+	if err := decoder.Decode(&cache); err != nil {
+		return nil, fmt.Errorf("decoding cache: %w", err)
+	}
+	dbgLog("loaded cache of %d entries\n", len(cache.Cache))
+	return &cache, nil
+}
+
+func loadOrInitCache(maildirPath string) (*MaildirCache, error) {
+	cache, err := loadCache(maildirPath)
+	if cache == nil && err == nil {
+		dbgLog("failed to load cache, initializing from existing content...")
+		m, err := initCache(maildirPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize maildir cache: %w", err)
+		}
+		return &MaildirCache{
+			Version: cacheVersion,
+			Cache:   m,
+		}, nil
+	}
+	return cache, err
+}
+
+func saveCache(cache *MaildirCache, maildirPath string) error {
+	dbgLog("saving cache")
+	cachePath := cachePath(maildirPath)
+
+	file, err := os.Create(cachePath)
+	if err != nil {
+		return fmt.Errorf("creating cache file: %w", err)
+	}
+	defer file.Close()
+
+	enc := gob.NewEncoder(file)
+	if err := enc.Encode(cache); err != nil {
+		return fmt.Errorf("encoding cache: %w", err)
+	}
+	return nil
+}
+
+func initCache(maildirPath string) (map[string]bool, error) {
+	existingMail := make(map[string]bool)
+
+	entries, err := os.ReadDir(filepath.Join(maildirPath, "new"))
+	if err != nil {
+		// TODO: include original error
+		return nil, fmt.Errorf("failed to read path '%s/new': %w", maildirPath, err)
+	}
+
+	for _, entry := range entries {
+		existingMail[entry.Name()] = true
+	}
+
+	entries, err = os.ReadDir(filepath.Join(maildirPath, "cur"))
+	if err != nil {
+		// TODO: include original error
+		return nil, fmt.Errorf("failed to read path '%s/cur'", maildirPath)
+	}
+
+	for _, entry := range entries {
+		filename := entry.Name()
+		ndxOfColon2 := strings.LastIndex(filename, ":2")
+		if ndxOfColon2 == -1 {
+			// not a mail file
+			continue
+		}
+		existingMail[filename[:ndxOfColon2]] = true
+	}
+
+	return existingMail, nil
+}
+
 func saveAsMaildir(mboxContent, destPath string) error {
 	messages := parseMboxMessages(mboxContent)
 	if len(messages) == 0 {
 		return fmt.Errorf("no messages found in mbox content")
 	}
+	newPath := filepath.Join(destPath, "new")
 
-	curPath := filepath.Join(destPath, "cur")
-	for i, message := range messages {
-		filename := generateMaildirFilename()
-		// Add a counter to ensure uniqueness
-		if i > 0 {
-			parts := strings.Split(filename, ":")
-			parts[0] = fmt.Sprintf("%s_%d", parts[0], i)
-			filename = strings.Join(parts, ":")
-		}
-
-		filePath := filepath.Join(curPath, filename)
-		if err := os.WriteFile(filePath, []byte(message), 0644); err != nil {
-			return fmt.Errorf("writing message to %s: %w", filePath, err)
-		}
+	cache, err := loadOrInitCache(destPath)
+	if err != nil {
+		return fmt.Errorf("failed to get a cache: %w", err)
 	}
 
-	log.Printf("Saved %d messages to maildir %s", len(messages), destPath)
+	numSaved := 0
+	for i, message := range messages {
+		rdr := strings.NewReader(message)
+		msg, err := mail.ReadMessage(rdr)
+		if err != nil {
+			return fmt.Errorf("cannot parse mail entry %d", i)
+		}
+		msgId := msg.Header.Get("Message-ID")
+		if msgId == "" {
+			panic("assertion failed - found message w/o a Message-ID")
+		}
+
+		hash := sha1.Sum([]byte(msgId))
+
+		// hash of message-id
+		filename := fmt.Sprintf("%x", hash)
+
+		if cache.Exists(filename) {
+			continue // skip
+		}
+
+		filePath := filepath.Join(newPath, filename)
+		if err := os.WriteFile(filePath, []byte(message), mailFileMode); err != nil {
+			return fmt.Errorf("writing message to %s: %w", filePath, err)
+		}
+		cache.Add(filename)
+		numSaved += 1
+	}
+
+	log.Printf("%d new of %d messages fetched", numSaved, len(messages))
+	if err = saveCache(cache, destPath); err != nil {
+		log.Printf("warning: failed to save maildir cache")
+	}
 	return nil
 }
 
+var config Config
+
 func main() {
-	var config Config
 
 	flag.StringVar(&config.Query, "query", "", "Xapian search query (required)")
-	flag.StringVar(&config.Query, "q", "", "Xapian search query (shorthand)")
+	flag.StringVar(&config.Query, "q", "", "-query shorthand")
 	flag.StringVar(&config.List, "list", "", "Mailing list name")
-	flag.StringVar(&config.List, "l", "", "Mailing list name (shorthand)")
-	flag.StringVar(&config.SaveTo, "save-to", "", "Save to file instead of importing")
-	flag.StringVar(&config.SaveTo, "s", "", "Save to file instead of importing (shorthand)")
-	flag.BoolVar(&config.Maildir, "maildir", false, "Save as maildir format (creates cur/new/tmp directories)")
-	flag.BoolVar(&config.Verbose, "verbose", false, "Enable verbose logging")
-	flag.BoolVar(&config.Verbose, "v", false, "Enable verbose logging (shorthand)")
+	flag.StringVar(&config.List, "l", "", "-list shorthand")
+	flag.StringVar(&config.Maildir, "maildir", "", "Save as maildir format (creates cur/new/tmp directories)")
+	flag.StringVar(&config.Mbox, "mbox", "", "Save as mbox file")
+	flag.Var(&config.Verbose, "verbose", "verbosity level (0=quiet, 1=info, 2=debug)")
+	flag.Var(&config.Verbose, "v", "-verbose shorthand")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s --query 'search terms' [options]\n\n", os.Args[0])
@@ -502,14 +660,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	if config.SaveTo == "" {
-		fmt.Fprintf(os.Stderr, "Error: --save-to is required\n\n")
+	if config.Maildir != "" && config.Mbox != "" {
+		fmt.Fprintf(os.Stderr, "Error: cannot BOTH save to mbox and maildir\n")
 		flag.Usage()
 		os.Exit(1)
 	}
 
 	// Initialize components
-	searcher := NewLoreSearcher(config.Verbose)
+	searcher := NewLoreSearcher(config.Verbose >= 2)
 
 	// Fetch mbox content directly
 	mboxContent, err := searcher.FetchMbox(config.Query, config.List)
@@ -523,24 +681,26 @@ func main() {
 
 	log.Printf("Retrieved mbox with %d lines", strings.Count(mboxContent, "\n"))
 
-	if config.Maildir {
-		// Validate maildir path
-		if err := validateMaildirPath(config.SaveTo); err != nil {
-			log.Fatalf("Maildir validation failed: %v", err)
-		}
-
-		// Create maildir structure
-		if err := createMaildirStructure(config.SaveTo); err != nil {
-			log.Fatalf("Failed to create maildir structure: %v", err)
+	if config.Maildir != "" {
+		// Check if destination exists
+		if _, err := os.Stat(config.Maildir); err == nil {
+			if err := validateMaildirPath(config.Maildir); err != nil {
+				log.Fatalf("Maildir validation failed: %v", err)
+			}
+		} else {
+			// Create maildir structure
+			if err := createMaildirStructure(config.Maildir); err != nil {
+				log.Fatalf("Failed to create maildir structure: %v", err)
+			}
 		}
 
 		// Save as maildir
-		if err := saveAsMaildir(mboxContent, config.SaveTo); err != nil {
+		if err := saveAsMaildir(mboxContent, config.Maildir); err != nil {
 			log.Fatalf("Failed to save as maildir: %v", err)
 		}
-	} else {
+	} else if config.Mbox != "" {
 		// Save as regular mbox file
-		if err := os.WriteFile(config.SaveTo, []byte(mboxContent), 0644); err != nil {
+		if err := os.WriteFile(config.Mbox, []byte(mboxContent), 0644); err != nil {
 			log.Fatalf("Failed to save file: %v", err)
 		}
 	}
