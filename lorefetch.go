@@ -679,9 +679,8 @@ func main() {
 		log.Fatal("No results found for your search query")
 	}
 
-	log.Printf("Retrieved mbox with %d lines", strings.Count(mboxContent, "\n"))
-
 	if config.Maildir != "" {
+		log.Printf("Retrieved mbox with %d lines", strings.Count(mboxContent, "\n"))
 		// Check if destination exists
 		if _, err := os.Stat(config.Maildir); err == nil {
 			if err := validateMaildirPath(config.Maildir); err != nil {
@@ -699,9 +698,12 @@ func main() {
 			log.Fatalf("Failed to save as maildir: %v", err)
 		}
 	} else if config.Mbox != "" {
+		log.Printf("Retrieved mbox with %d lines", strings.Count(mboxContent, "\n"))
 		// Save as regular mbox file
 		if err := os.WriteFile(config.Mbox, []byte(mboxContent), 0644); err != nil {
 			log.Fatalf("Failed to save file: %v", err)
 		}
+	} else {
+		fmt.Println(mboxContent)
 	}
 }
